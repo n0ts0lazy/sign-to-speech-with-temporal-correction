@@ -1,2 +1,6 @@
 env
 platform_verif.py
+data/labeled
+data/unlabeled
+.vscode
+create_folder_tree.py
