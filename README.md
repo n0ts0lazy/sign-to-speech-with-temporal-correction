@@ -8,3 +8,7 @@ Make sure to enable kernel if you are runnign the notebook for data visualizatio
 Training data:
 ASL Sign Language (Labelled Data for training): [Available Here](https://www.kaggle.com/datasets/grassknoted/asl-alphabet)
 
+WLASL (Labelled for Training-Video):[Available Here](https://www.kaggle.com/datasets/risangbaskoro/wlasl-processed)
+
+OpenASL (Unlabled for Validation):[Available Here](https://github.com/chevalierNoir/OpenASL)
+
