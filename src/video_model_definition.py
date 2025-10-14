@@ -134,6 +134,7 @@ class WLASLDataset(Dataset):
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
         self.frame_tfms = transforms.Compose(tfms)
+        self._cache = {} 
 
         if use_manifest is None:
             use_manifest = (self.data_root / MANIFEST_JSON).exists()
@@ -201,10 +202,13 @@ class WLASLDataset(Dataset):
 
     def __getitem__(self, idx: int):
         meta = self.samples[idx]
+        if meta.path in self._cache:
+            return self._cache[meta.path], meta.label
+        
 
         try:
             if _USE_DECORD:
-                vr = VideoReader(meta.path, ctx=decord_cpu(0), num_threads=1)
+                vr = VideoReader(meta.path, ctx=decord_cpu(0), num_threads=8)
                 total = len(vr)
                 if total == 0:
                     raise ValueError("Empty video stream")
@@ -230,7 +234,8 @@ class WLASLDataset(Dataset):
 
             # Apply transforms per-frame to save memory
             clip = torch.stack([self.frame_tfms(f) for f in clip], dim=0)  # (T, C, H, W)
-
+            
+            self._cache[meta.path] = clip
             return clip, meta.label
 
         except Exception as e:
@@ -507,11 +512,13 @@ def build_dataloaders(
     # Host-process only: no multiprocessing, no pin_memory
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=0, pin_memory=False, collate_fn=collate, persistent_workers=False
+        num_workers=23, pin_memory=True,
+        collate_fn=collate, persistent_workers=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=0, pin_memory=False, collate_fn=collate, persistent_workers=False
+        num_workers=23, pin_memory=True,
+    collate_fn=collate, persistent_workers=True
     )
     return train_loader, val_loader, n_cls, ds.class_to_idx
 
