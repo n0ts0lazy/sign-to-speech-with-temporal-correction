@@ -134,7 +134,6 @@ class WLASLDataset(Dataset):
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
         self.frame_tfms = transforms.Compose(tfms)
-        self._cache = {} 
 
         if use_manifest is None:
             use_manifest = (self.data_root / MANIFEST_JSON).exists()
@@ -202,13 +201,11 @@ class WLASLDataset(Dataset):
 
     def __getitem__(self, idx: int):
         meta = self.samples[idx]
-        if meta.path in self._cache:
-            return self._cache[meta.path], meta.label
         
 
         try:
             if _USE_DECORD:
-                vr = VideoReader(meta.path, ctx=decord_cpu(0), num_threads=8)
+                vr = VideoReader(meta.path, ctx=decord_cpu(0), num_threads=1)
                 total = len(vr)
                 if total == 0:
                     raise ValueError("Empty video stream")
@@ -235,15 +232,56 @@ class WLASLDataset(Dataset):
             # Apply transforms per-frame to save memory
             clip = torch.stack([self.frame_tfms(f) for f in clip], dim=0)  # (T, C, H, W)
             
-            self._cache[meta.path] = clip
             return clip, meta.label
 
         except Exception as e:
-            print(f"[WARN] Skipping video {meta.path}: {e}")
-            with open("skipped_videos.log", "a") as logf:
-                logf.write(f"{meta.path} - {e}\n")
+            ##################
+            bad_path = None
+            try:
+                bad_path = meta.path
+                print(f"[WARN] Skipping video {bad_path}: {e}")
+                with open("skipped_videos.log", "a") as logf:
+                    logf.write(f"{bad_path} - {e}\n")
+            except Exception:
+                print(f"[WARN] Could not identify bad file at index {idx}: {e}")
 
-            return self.__getitem__((idx + 1) % len(self))
+            # Try a few subsequent videos instead of recursing
+            for _ in range(3):
+                idx = (idx + 1) % len(self.samples)
+                try:
+                    meta_next = self.samples[idx]
+                    if hasattr(self, "_cache") and meta_next.path in self._cache:
+                        return self._cache[meta_next.path], meta_next.label
+
+                    # Minimal reload using same decode path as normal
+                    if _USE_DECORD:
+                        vr = VideoReader(meta_next.path, ctx=decord_cpu(0), num_threads=1)
+                        vid = torch.stack([torch.from_numpy(f.asnumpy()) for f in vr])
+                        vid = vid.permute(0, 3, 1, 2).float() / 255.0
+                    else:
+                        vid, _, _ = read_video(meta_next.path, pts_unit="sec")
+                        if vid.numel() == 0:
+                            raise ValueError("Empty video stream")
+                        vid = vid.permute(0, 3, 1, 2).float() / 255.0
+
+                    inds = self._sample_indices(vid.shape[0])
+                    clip = vid[inds]
+                    clip = torch.stack([self.frame_tfms(f) for f in clip], dim=0)
+                    if hasattr(self, "_cache"):
+                        self._cache[meta_next.path] = clip
+                    return clip, meta_next.label
+
+                except Exception as e2:
+                    print(f"[WARN] Also failed to load {meta_next.path}: {e2}")
+                    with open("skipped_videos.log", "a") as logf:
+                        logf.write(f"{meta_next.path} - {e2}\n")
+                    continue
+
+            # If we still fail after 3 tries, move on but don't crash
+            print(f"[WARN] Repeated video load failures starting from {bad_path or 'unknown'}")
+            dummy = torch.zeros((self.frames_per_clip, 3, 224, 224))
+            return dummy, -1
+
 
 # ----------------------------
 # Split helpers
@@ -642,7 +680,7 @@ def build_argparser():
     p.add_argument("--model", choices=["vit", "mvit"], default="mvit",
                    help="Model architecture (default: mvit).")
     p.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT))
-    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=2, help="Smaller default to keep RAM usage low.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--frames-per-clip", type=int, default=32)
