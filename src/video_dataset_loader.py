@@ -1,125 +1,113 @@
 import os
 import json
+import cv2
 import torch
-from torch.utils.data import Dataset
-from torchvision.io import read_video
+from torch.utils.data import Dataset, DataLoader
 
-_USE_DECORD = False
-try:
-    from decord import VideoReader, cpu as decord_cpu
-    _USE_DECORD = True
-except ImportError:
-    pass
+# =====================================================
+# Configuration
+# =====================================================
+MAX_FRAMES = 16  # can be 8 or 16 depending on your model
+RESIZE_HW = (224, 224)  # height, width for MViT
+# =====================================================
 
 
-class WLASLVideoDataset(Dataset):
-    """
-    Loader for WLASL videos with automatic split detection.
-    Works when you have folder-split data (train/val/test) AND
-    a WLASL-style JSON file containing 'instances' lists.
-    """
-    def __init__(self, root_dir, metadata_path, split="val", frame_tfms=None, frames_per_clip=16):
-        self.root_dir = root_dir
-        self.split = split
-        self.frame_tfms = frame_tfms
-        self.frames_per_clip = frames_per_clip
+class WLASLDataset(Dataset):
+    def __init__(self, json_path, video_root, split="train", transform=None):
+        self.video_root = video_root
+        self.transform = transform
+
+        # Load JSON metadata
+        with open(json_path, "r") as f:
+            all_data = json.load(f)
+
         self.samples = []
-        self.missing = 0
+        for gloss_entry in all_data:
+            gloss = gloss_entry.get("gloss")
+            for inst in gloss_entry.get("instances", []):
+                if inst.get("split") == split:
+                    vid_id = inst.get("video_id")
+                    video_path = os.path.join(video_root, f"{vid_id}.mp4")
+                    if os.path.exists(video_path):
+                        self.samples.append((video_path, gloss))
 
-        # --- Load metadata ---
-        with open(metadata_path, "r") as f:
-            meta = json.load(f)
-
-        # JSON can be list (WLASL) or dict with splits
-        if isinstance(meta, dict) and split in meta:
-            entries = meta[split]
-            print(f"[INFO] Using split key '{split}' with {len(entries)} entries.")
-        elif isinstance(meta, list):
-            entries = meta
-            print(f"[INFO] Using flat WLASL-style JSON with {len(entries)} gloss entries.")
-        else:
-            raise ValueError(f"Unrecognized metadata format for split '{split}'.")
-
-        # Determine base directory for videos
-        split_dir = os.path.join(root_dir, split)
-        base_dir = split_dir if os.path.isdir(split_dir) else root_dir
-        print(f"[INFO] Using base directory: {base_dir}")
-
-        # --- Build samples from entries ---
-        for entry in entries:
-            # WLASL format: each gloss has multiple instances
-            if "instances" in entry:
-                label = entry.get("gloss") or entry.get("label") or 0
-                for inst in entry["instances"]:
-                    vid = inst.get("video_id")
-                    inst_split = inst.get("split", split)
-
-                    # Match only chosen split
-                    if self.split and inst_split != self.split:
-                        continue
-
-                    filename = f"{vid}.mp4" if vid else None
-                    if not filename:
-                        self.missing += 1
-                        continue
-
-                    full_path = os.path.join(root_dir, inst_split, filename)
-
-                    if os.path.exists(full_path):
-                        self.samples.append({"path": full_path, "label": label})
-                    else:
-                        self.missing += 1
-            else:
-                # Fallback for simple JSON entries
-                label = entry.get("label", 0)
-                vid = entry.get("video_id") or entry.get("id")
-                if not vid:
-                    self.missing += 1
-                    continue
-
-                filename = f"{vid}.mp4"
-                full_path = os.path.join(base_dir, filename)
-                if os.path.exists(full_path):
-                    self.samples.append({"path": full_path, "label": label})
-                else:
-                    self.missing += 1
-
-        self.classes = sorted({s["label"] for s in self.samples})
-        print(f"[INFO] Loaded {len(self.samples)} valid videos (skipped {self.missing}). Classes: {len(self.classes)}")
+        print(f"[WLASL] Split={split} | Videos={len(self.samples)} | Classes≈{len(all_data)}")
 
     def __len__(self):
         return len(self.samples)
 
-    def _sample_indices(self, total_frames):
-        """Uniformly sample frame indices."""
-        if total_frames < self.frames_per_clip:
-            reps = (self.frames_per_clip // max(1, total_frames)) + 1
-            idx = (list(range(total_frames)) * reps)[:self.frames_per_clip]
-            return idx
-        step = total_frames / self.frames_per_clip
-        return [int(i * step) for i in range(self.frames_per_clip)]
-
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        video_path, label = sample["path"], sample["label"]
+        video_path, label = self.samples[idx]
+        frames = self.load_video_frames(video_path)
+        return {"video": frames, "label": label}
 
-        # --- Read video ---
-        try:
-            if _USE_DECORD:
-                vr = VideoReader(video_path, ctx=decord_cpu())
-                frames = [torch.from_numpy(f.asnumpy()) for f in vr]
-                vid = torch.stack(frames).permute(0, 3, 1, 2).float() / 255.0
-            else:
-                vid, _, _ = read_video(video_path, pts_unit="sec")
-                vid = vid.permute(0, 3, 1, 2).float() / 255.0
-        except Exception as e:
-            print(f"[WARN] Could not read video: {video_path} ({e})")
-            return torch.zeros((self.frames_per_clip, 3, 112, 112)), 0
+    def load_video_frames(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        frames = []
 
-        inds = self._sample_indices(vid.shape[0])
-        clip = vid[inds]
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        if self.frame_tfms:
-            clip = torch.stack([self.frame_tfms(f) for f in clip], dim=0)
+            # Convert to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        return clip, label
+            # Resize frame to model expected size (224×224)
+            frame = cv2.resize(frame, RESIZE_HW)
+
+            # Convert to tensor [3, H, W]
+            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+            frames.append(frame_tensor)
+
+        cap.release()
+
+        # Handle missing or empty video
+        if len(frames) == 0:
+            frames = [torch.zeros((3, *RESIZE_HW))]
+
+        num_frames = len(frames)
+
+        # Uniformly sample or pad to fixed length
+        if num_frames > MAX_FRAMES:
+            indices = torch.linspace(0, num_frames - 1, MAX_FRAMES).long()
+            frames = [frames[i] for i in indices]
+        elif num_frames < MAX_FRAMES:
+            frames += [frames[-1]] * (MAX_FRAMES - num_frames)
+
+        frames = torch.stack(frames)  # [T, 3, H, W]
+        return frames
+
+
+# =====================================================
+# Collate Function
+# =====================================================
+def pad_collate_fn(batch):
+    """Combine variable-length videos into a batch tensor"""
+    videos = [item["video"] for item in batch]
+    labels = [item["label"] for item in batch]
+
+    # Stack along batch dimension
+    videos = torch.stack(videos)  # [B, T, 3, H, W] (we’ll fix order below)
+    videos = videos.permute(0, 2, 1, 3, 4)  # [B, 3, T, H, W]
+
+    return videos, labels
+
+
+# =====================================================
+# Example Usage (only runs if file executed directly)
+# =====================================================
+if __name__ == "__main__":
+    ds = WLASLDataset(
+        json_path="../data/video/WLASL_rebuilt.json",
+        video_root="../data/video/transcoded",
+        split="train",
+    )
+
+    print("Dataset size:", len(ds))
+    sample = ds[0]
+    print("Single sample shape:", sample["video"].shape)
+
+    dl = DataLoader(ds, batch_size=4, shuffle=True, collate_fn=pad_collate_fn)
+    videos, labels = next(iter(dl))
+    print("Batch shape:", videos.shape)

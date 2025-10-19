@@ -24,7 +24,7 @@ def safe_copy_or_link(src, dst, move=False):
 
 
 def force_video_split_with_metadata(
-    root_dir="data/video/videos",
+    root_dir="data/video/processed",
     output_root="data/video",
     metadata_path="data/video/WLASL_v0.3.json",
     train_ratio=0.7,
@@ -132,7 +132,7 @@ def force_video_split_with_metadata(
 
 if __name__ == "__main__":
     force_video_split_with_metadata(
-        root_dir="data/video/videos",
+        root_dir="data/video/processed",
         output_root="data/video",
         metadata_path="data/video/WLASL_v0.3.json",
         train_ratio=0.7,

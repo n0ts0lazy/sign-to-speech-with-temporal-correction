@@ -4,7 +4,9 @@ data/labeled
 data/unlabeled
 .vscode
 create_folder_tree.py
-src/__pycache__
 ref_oasl
 data/video
 *.pyc
+OASL_processed
+*.pth
+src/__pycache__/__init__.cpython-312.pyc

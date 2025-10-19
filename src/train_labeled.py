@@ -35,10 +35,6 @@ def build_model(model_name, num_classes):
     name = model_name.lower()
     if name in ["resnet", "resnet18"]:
         return make_resnet18(num_classes)
-    elif name in ["mobilenet", "mobilenetv3"]:
-        return make_mobilenet(num_classes)
-    elif name in ["cnn_lstm", "cnnlstm"]:
-        return make_cnn_lstm(num_classes)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
