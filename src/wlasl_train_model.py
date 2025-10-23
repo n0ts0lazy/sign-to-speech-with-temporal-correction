@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-video_train_model.py — Final full version
-- Early stopping (patience=50, based on training)
-- Warmup + cosine LR schedule
-- Freeze/unfreeze backbone (first 20 epochs frozen)
-- Label smoothing (0.05)
-- Always-on Kinetics-400 pretrained weights
-- Merged val+test evaluation
-- Comma-separated CSV log with auto-flush
-- Full visible validation prints every eval epoch
-"""
 
 import os
 import time
@@ -23,7 +12,7 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from video_dataset_loader import WLASLDataset, pad_collate_fn
+from wlasl_dataset_loader import WLASLDataset, pad_collate_fn
 from video_model_definition import create_mvit_model
 
 
@@ -37,7 +26,6 @@ def set_lr(optimizer, lr: float):
 
 
 def lr_with_warmup_and_cosine(base_lr, epoch, total_epochs, warmup_epochs=5, start_cosine_at=40, min_lr=1e-6):
-    """Gradual warmup then cosine decay"""
     if epoch <= warmup_epochs:
         return base_lr * (max(1, epoch) / warmup_epochs)
     if epoch < start_cosine_at:
@@ -48,9 +36,9 @@ def lr_with_warmup_and_cosine(base_lr, epoch, total_epochs, warmup_epochs=5, sta
 
 
 def load_kinetics_weights(model, device):
-    """Load pretrained weights from Kinetics-400 via Torch Hub"""
     try:
         print("[INFO] Loading Kinetics-400 pretrained weights via Torch Hub...")
+        torch.hub._validate_not_a_forked_repo = lambda a, b, c: True  # suppress fork warnings
         pretrained_model = torch.hub.load("facebookresearch/pytorchvideo", "mvit_base_16x4", pretrained=True)
         model_dict = model.state_dict()
         pretrained_dict = pretrained_model.state_dict()
@@ -64,7 +52,6 @@ def load_kinetics_weights(model, device):
 
 
 def freeze_backbone_until_epoch(model, epoch, unfreeze_epoch=20):
-    """Freeze all except head/classifier layers for first few epochs"""
     should_freeze = epoch <= unfreeze_epoch
     for name, p in model.named_parameters():
         if any(tag in name.lower() for tag in ["head", "classifier", "proj", "fc"]):
@@ -102,9 +89,6 @@ def train_model(
     os.makedirs(results_dir, exist_ok=True)
     csv_path = os.path.join(results_dir, f"training_log_{model_name}.csv")
 
-    # ---------------------------
-    # Dataset Loading
-    # ---------------------------
     print("[INFO] Loading datasets...")
     train_ds = WLASLDataset(json_path, video_root, split="train")
     val_ds = WLASLDataset(json_path, video_root, split="val")
@@ -147,16 +131,14 @@ def train_model(
             return torch.empty(0), torch.empty(0, dtype=torch.long)
         return torch.stack(valid_videos), torch.tensor(valid_labels, dtype=torch.long)
 
+    persistent = num_workers > 0
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, collate_fn=collate_fn_with_labels,
-                              persistent_workers=True, pin_memory=True)
+                              persistent_workers=persistent, pin_memory=True)
     eval_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
                              num_workers=num_workers, collate_fn=collate_fn_with_labels,
-                             persistent_workers=True, pin_memory=True)
+                             persistent_workers=persistent, pin_memory=True)
 
-    # ---------------------------
-    # Model, Loss, Optimizer
-    # ---------------------------
     num_classes = len(gloss_to_idx)
     model = create_mvit_model(num_classes=num_classes, pretrained=False)
     load_kinetics_weights(model, device)
@@ -173,31 +155,32 @@ def train_model(
     best_model_name = "NA"
     no_improve_epochs = 0
 
-    # Create CSV header once
     if not os.path.exists(csv_path):
-        with open(csv_path, "w") as f:
+        with open(csv_path, "w", newline='') as f:
             f.write("epoch,train_loss,train_acc,val_acc,elapsed,model_file\n")
             f.flush()
             os.fsync(f.fileno())
 
-    # ---------------------------
-    # Epoch Loop
-    # ---------------------------
     for epoch in range(1, epochs + 1):
         new_lr = lr_with_warmup_and_cosine(lr, epoch, epochs, warmup_epochs, start_cosine_at, min_lr)
         set_lr(optimizer, new_lr)
         freeze_backbone_until_epoch(model, epoch, freeze_until_epoch)
 
-        # ---- Train ----
-        model.train()
-        running_loss, correct, total = 0.0, 0, 0
         start_t = time.time()
         print(f"\n🌀 Epoch [{epoch}/{epochs}] — Training (lr={new_lr:.6f})")
 
+        model.train()
+        running_loss, correct, total = 0.0, 0, 0
         with tqdm(total=len(train_loader), desc=f"Epoch {epoch}/{epochs}", ncols=100) as pbar:
             for videos, labels in train_loader:
-                if videos.numel() == 0:
+                # --- Strong batch validation ---
+                if (
+                    videos is None or labels is None or
+                    videos.numel() == 0 or labels.numel() == 0 or
+                    videos.size(0) != labels.size(0)
+                ):
                     continue
+
                 videos, labels = videos.to(device), labels.to(device)
 
                 optimizer.zero_grad()
@@ -209,7 +192,7 @@ def train_model(
                 running_loss += loss.item()
                 _, preds = outputs.max(1)
                 correct += preds.eq(labels).sum().item()
-                total += labels.size(0)
+                total += labels.numel()
 
                 avg_loss = running_loss / (pbar.n + 1)
                 train_acc_live = 100.0 * correct / max(total, 1)
@@ -220,19 +203,25 @@ def train_model(
         train_acc = 100.0 * correct / max(total, 1)
         elapsed = time.time() - start_t
 
+        # Accuracy sanity check
+        if train_acc > 100.0:
+            print(f"[WARN] Train accuracy exceeded 100% ({train_acc:.2f}%) — possible dataset inconsistency.")
+
         # ---- Validation ----
         eval_acc, eval_loss, ran_eval = 0.0, 0.0, False
         if len(val_ds) > 0 and (epoch % eval_every == 0 or epoch == 1 or epoch == epochs):
             ran_eval = True
-            print(f"🔍 Starting validation for epoch {epoch} ...")
+            print(f"🔍 Validation for epoch {epoch} ...")
             model.eval()
             correct_e, total_e, loss_e_sum = 0, 0, 0.0
-            total_batches = len(eval_loader)
-            print(f"[INFO] Validation has {total_batches} batches (~{len(val_ds)} samples)")
 
             with torch.no_grad():
-                for batch_idx, (videos, labels) in enumerate(eval_loader, start=1):
-                    if videos.numel() == 0:
+                for videos, labels in eval_loader:
+                    if (
+                        videos is None or labels is None or
+                        videos.numel() == 0 or labels.numel() == 0 or
+                        videos.size(0) != labels.size(0)
+                    ):
                         continue
                     videos, labels = videos.to(device), labels.to(device)
                     outputs = model(videos)
@@ -240,17 +229,14 @@ def train_model(
                     loss_e_sum += loss_e.item()
                     _, preds = outputs.max(1)
                     correct_e += preds.eq(labels).sum().item()
-                    total_e += labels.size(0)
-                    if batch_idx % 50 == 0 or batch_idx == total_batches:
-                        interim_acc = 100.0 * correct_e / max(total_e, 1)
-                        print(f"  [Batch {batch_idx}/{total_batches}] running ValAcc={interim_acc:.2f}%")
+                    total_e += labels.numel()
 
-            eval_loss = loss_e_sum / max(1, total_batches)
+            eval_loss = loss_e_sum / max(1, len(eval_loader))
             eval_acc = 100.0 * correct_e / max(total_e, 1)
-            print(f"✅ Finished validation — ValLoss={eval_loss:.4f}, ValAcc={eval_acc:.2f}%")
+            print(f"✅ ValLoss={eval_loss:.4f}, ValAcc={eval_acc:.2f}%")
 
-        # ---- Save if train improved ----
-        improved = (train_acc > best_train_acc + 1e-9) and (train_loss < best_train_loss - 1e-9)
+        # ---- Save if training improved ----
+        improved = (train_acc > best_train_acc + 0.05) or (train_loss < best_train_loss - 1e-4)
         if improved:
             best_train_acc, best_train_loss = train_acc, train_loss
             no_improve_epochs = 0
@@ -266,18 +252,13 @@ def train_model(
 
         # ---- CSV Logging ----
         val_acc_for_log = eval_acc if ran_eval else 0.0
-        with open(csv_path, "a") as f:
+        with open(csv_path, "a", newline='') as f:
             f.write(f"{epoch},{train_loss:.4f},{train_acc:.2f},{val_acc_for_log:.2f},{elapsed:.1f},{best_model_name}\n")
             f.flush()
             os.fsync(f.fileno())
 
-        # ---- Console Summary ----
-        if ran_eval:
-            print(f"📊 Epoch {epoch}/{epochs} — Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}% | "
-                  f"ValAcc={eval_acc:.2f}% | Time={elapsed:.1f}s")
-        else:
-            print(f"📊 Epoch {epoch}/{epochs} — Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}% | "
-                  f"ValAcc=N/A | Time={elapsed:.1f}s")
+        print(f"📊 Epoch {epoch}/{epochs} — Train: Loss={train_loss:.4f}, Acc={train_acc:.2f}% | "
+              f"ValAcc={'N/A' if not ran_eval else f'{eval_acc:.2f}%'} | Time={elapsed:.1f}s")
 
     print(f"\n🎯 Training complete. Log written to: {csv_path}")
 
@@ -287,7 +268,7 @@ def train_model(
 # ---------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train MViT (full visible)")
+    parser = argparse.ArgumentParser(description="Train MViT (final refined)")
     parser.add_argument("--json_path", type=str, default="./data/video/WLASL_stratified.json")
     parser.add_argument("--video_root", type=str, default="./data/video/transcoded")
     parser.add_argument("--output_dir", type=str, default="./models/checkpoints")

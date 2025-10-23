@@ -11,3 +11,9 @@ OASL_processed
 *.pth
 src/__pycache__/__init__.cpython-312.pyc
 src/__pycache__/__init__.cpython-312.pyc
+fixer.py
+notebooks/eda_outputs
+notebooks/asl_alphabet_eda_summary.csv
+src/__pycache__/__init__.cpython-312.pyc
+results/openasl/training_log_openasl.csv
+results/oasl/training_log_oasl.csv
