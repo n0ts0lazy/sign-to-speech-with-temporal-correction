@@ -1,1 +1,0 @@
-The dataset is not present inside the data folder due to licensing reason, kindly refer to README.md for the link to training data
